@@ -1,0 +1,322 @@
+---
+title: "TPN_housing_data"
+author: "Neena Hagen"
+date: "3/28/2022"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(jsonlite))
+suppressPackageStartupMessages(library(lubridate))
+suppressPackageStartupMessages(library(stringr))
+suppressPackageStartupMessages(library(sf))
+suppressPackageStartupMessages(library(httr))
+```
+
+# Allegheny County Health Department Violations
+
+### Loading data
+
+Load health violations data from WPRDC
+
+```{r}
+service <- read_csv("https://data.wprdc.org/datastore/dump/6bf7c881-2164-4212-b714-8bea3f660f57")
+inspect <- read_csv("https://data.wprdc.org/datastore/dump/a39e5edc-0001-404f-b4af-05534e34526f") 
+violate <- read_csv("https://data.wprdc.org/datastore/dump/f3df0760-54cc-4279-b7c8-a12a60f4f0f6")
+```
+
+Merge data sets along `INSPECT_ID` and `SR_NUM`
+
+```{r}
+health_list <- list(service, inspect, violate)
+health_raw <- Reduce(function(x, y) merge(x, y, by=c("INSPECT_ID", "SR_NUM"), all=TRUE), health_list, accumulate=FALSE)
+```
+
+### Cleaning data
+
+Filter health violations to Oakland neighborhood
+
+```{r}
+oak_health <- health_raw %>% 
+  filter(CENSUS_TRACT==30405 | CENSUS_TRACT==30404 | CENSUS_TRACT==30402 | CENSUS_TRACT==30409)
+```
+
+
+Filter date range to match PLI data: 01/01/2016 - 2/16/2022
+
+```{r}
+oak_health <- oak_health %>% 
+  filter(BEG_DATE >= as.Date("2018-01-01") & BEG_DATE <= as.Date("2022-06-02"))
+```
+
+```{r}
+most_cited_oak <- oak_health %>% 
+  group_by(STREET) %>% 
+  tally()
+```
+
+Split address suffix into different column
+
+```{r}
+oak_health <- extract(oak_health, STREET, into = c('partA', 'partB'), '(.*)\\s+([^ ]+)$')
+```
+
+Change suffixes to USPS standard
+
+```{r}
+oak_health$partB <- str_replace(oak_health$partB, "STREET", "ST")
+oak_health$partB <- str_replace(oak_health$partB, "AVENUE", "AVE")
+oak_health$partB <- str_replace(oak_health$partB, "ROAD", "RD")
+oak_health$partB <- str_replace(oak_health$partB, "DRIVE", "DR")
+oak_health$partB <- str_replace(oak_health$partB, "SQUARE", "SQ")
+oak_health$partB <- str_replace(oak_health$partB, "PLACE", "PL")
+oak_health$partB <- str_replace(oak_health$partB, "COURT", "CT")
+```
+
+
+Add column with correctly formatted addresses
+
+```{r}
+oak_health <- oak_health %>%
+  mutate(MOD_STREET = paste0(partA, " ", partB)) %>% 
+  select(1:2, 6:23) %>% 
+  relocate(MOD_STREET, .after = SR_NUM)
+```
+
+More string replaces to standardize formatting
+
+```{r}
+oak_health$MOD_STREET <- oak_health$MOD_STREET %>% 
+  str_replace(" FIFTH ", " 5TH ") %>% 
+  str_replace(" DE RUAD", "DERAUD ") %>% 
+  str_squish()
+```
+
+### Geocoding
+
+Prepare dataframe for geocoding
+
+```{r}
+oak_health_for_geo <- oak_health %>% 
+  group_by(MOD_STREET, CITY, STATE, ZIP) %>% 
+  tally() %>% 
+  unite("ADD", 1:4, sep=" ") %>% 
+  filter(ADD != "ROBINSON ST PITTSBURGH PA 15213")
+```
+
+Geocode!
+
+```{r}
+oak_health_geocoded <- data.frame()
+```
+
+```{r}
+
+for (i in 1:nrow(oak_health_for_geo)) {
+  
+  try({
+    
+    addr <- oak_health_for_geo[i,1]
+    link <- paste("https://tools.wprdc.org/geo/geocode?addr=", addr)
+    output <- GET(link) %>% 
+      content(as="text") %>% 
+      fromJSON() %>% 
+      as.data.frame() %>% 
+      bind_cols(addr)
+    oak_health_geocoded <- rbind(oak_health_geocoded, output)
+    print(output)
+  }, silent=TRUE)
+
+}
+```
+
+Find addresses that failed to geocode
+
+253 Halket Pl
+3238 Hardie Way
+
+```{r}
+failed_to_geo <- anti_join(oak_health_for_geo, oak_health_geocoded) %>% 
+  select(ADD)
+```
+
+### Cleaning geocoded data
+
+Remove unnecessary columns
+
+```{r}
+oak_health_geocoded_cleaned <- oak_health_geocoded %>% 
+  select(2:3, 21, 27)
+
+colnames(oak_health_geocoded_cleaned) <- c("coords","parcel_id", "neighborhood", "addr")
+```
+
+Make lat and long two distinct columns 
+
+```{r}
+oak_health_geocoded_cleaned <- oak_health_geocoded_cleaned %>% 
+  mutate(coord_type = ifelse(row_number() %% 2, "lng", "lat")) %>% 
+  pivot_wider(names_from = coord_type, values_from = coords)
+```
+
+Split up addresses and then reformat into original: not the prettiest but it works!
+
+```{r}
+oak_health_geocoded_cleaned <- extract(oak_health_geocoded_cleaned, addr, into = c('partA', 'ZIP'), '(.*)\\s+([^ ]+)$')
+
+oak_health_geocoded_cleaned <- extract(oak_health_geocoded_cleaned, partA, into = c('partAA', 'STATE'), '(.*)\\s+([^ ]+)$')
+
+oak_health_geocoded_cleaned <- extract(oak_health_geocoded_cleaned, partAA, into = c('MOD_STREET', 'CITY'), '(.*)\\s+([^ ]+)$')
+```
+
+Light cleaning on original health dataset
+
+```{r}
+oak_health$ZIP <- as.character(oak_health$ZIP)
+```
+
+Join geocoded data back into original health dataset and remove unwanted columns
+
+```{r}
+oak_health_final <- right_join(oak_health_geocoded_cleaned, oak_health)
+```
+
+# Pittsburgh Permits, Licenses and Inspections Violations
+
+### Loading Data
+
+```{r}
+pli_old <- read_csv("~/Downloads/DataJournalism/pli_old.csv")
+colnames(pli_old)
+```
+
+```{r}
+pli_new <- read_csv("~/Downloads/DataJournalism/pli_updated.csv")
+colnames(pli_new)
+```
+
+```{r}
+pli_code <- read_csv("~/Downloads/pli_code.csv")
+head(pli_code)
+```
+
+### Cleaning data
+
+JUDGEMENT CALL: I'm waiting until after cleaning to filter down to Oakland, because I want to have the entire dataset cleaned in case we want to analyze other parts. Didn't do this with the health dataset because there wasn't much cleaning.
+
+Renaming columns so cleaning function will work
+
+```{r}
+colnames(pli_new) <- str_to_upper(colnames(pli_new))
+colnames(pli_new)[1] <- "ID"
+colnames(pli_code) <- c("VIOLATION", "DESCRIPTION")
+```
+
+This function takes two arguments, the empty dataframe to insert cleaned data and the original dataframe we loaded in. It performs the following tasks:
+
+* Duplicates `VIOLATION` column so there's a column to clean
+* Replaces all semi-colons with a space -- this makes it easier for format later
+* Removes all letters to get rid of all words in the column 
+* Removes code-year labels
+* Removes all punctuation except periods, because violation numbers contain periods
+* Uses `str_squish` to standardize spacing 
+* Puts each violation on separate line
+* Puts the `MOD_VIOL` column next to the `VIOLATION` column for comparison
+
+403.62a
+403.42a
+108.1.1a
+
+```{r}
+clean_pli_func <- function(x,y) {
+  x <- y %>% mutate(MOD_VIOL = VIOLATION)
+  x$MOD_VIOL <- str_replace_all(x$MOD_VIOL, ";", " ")
+  x$MOD_VIOL <- str_replace_all(x$MOD_VIOL, "[a-zA-Z]", "")
+  x$MOD_VIOL <- str_replace_all(x$MOD_VIOL, c("2003|2008|2009|2012|2015"), "")
+  x$MOD_VIOL <- str_replace_all(x$MOD_VIOL, "(?![.])[[:punct:]]", " ")
+  x$MOD_VIOL <- str_squish(x$MOD_VIOL)
+  x <- x %>% separate_rows(MOD_VIOL) %>%
+    relocate(MOD_VIOL, .after = VIOLATION)
+}
+```
+
+Clean original datasets using `clean_pli_func`
+
+```{r}
+pli_old_cleaned <- clean_pli_func(pli_old_cleaned, pli_old)
+pli_new_cleaned <- clean_pli_func(pli_new_cleaned, pli_new)
+pli_code_cleaned <- clean_pli_func(pli_code_cleaned, pli_code)
+```
+
+Add `ID` column to `pli_old_cleaned` to make it match with `pli_new_cleaned` for binding
+
+```{r}
+pli_old_cleaned <- pli_old_cleaned %>% 
+  mutate(ID = NA) %>% 
+  relocate(ID, .before = STREET_NUM)
+```
+
+Remove duplicates from `pli_code_cleaned`
+
+```{r}
+pli_code_cleaned <- pli_code_cleaned %>% 
+  distinct(MOD_VIOL, .keep_all = TRUE) %>% 
+  select(-VIOLATION)
+```
+
+Concatenate `pli_old_cleaned` and `pli_new_cleaned` and join with `pli_code_cleaned`
+
+```{r}
+pli_cleaned <- rbind(pli_old_cleaned, pli_new_cleaned) %>% 
+  inner_join(pli_code_cleaned, by="MOD_VIOL")
+```
+
+Find rows that failed to join with a corresponding PLI code -- mostly junk
+
+```{r}
+failed_to_find_pli_code <- anti_join(pli_cleaned, pli_code_cleaned, by = "MOD_VIOL")
+```
+
+Filter data down to Oakland
+
+```{r}
+oak_pli_final <- pli_cleaned %>% 
+  filter(grepl("Oakland", NEIGHBORHOOD))
+```
+
+Finalize PLI dataset for Oakland
+
+```{r}
+oak_pli_final <- oak_pli_final %>% 
+  mutate(ADD = paste0(STREET_NUM, " ", STREET_NAME)) %>% 
+  select(1, 4:6, 8:13, 21:24) %>% 
+  relocate(ADD, .after = ID) %>% 
+  relocate(DESCRIPTION, .after = MOD_VIOL)
+```
+
+# Property Assessments
+
+### Loading data
+
+Filtering immediately when loading because the file is huge
+
+```{r}
+prop <- read_csv("~/Downloads/prop_assess_2021.csv") %>%
+  select(c(1:3,5,9,35,36,46,50,79,85,92:103)) %>% 
+  filter(FAIRMARKETBUILDING > 10) %>% 
+  filter(PROPERTYZIP==15213 | PROPERTYZIP==15219 | PROPERTYZIP==15208) %>% 
+  select(1:11,14:15) %>% 
+  mutate(ADDRESS = paste0(PROPERTYHOUSENUM, " ", PROPERTYADDRESS)) %>% 
+  select(-PROPERTYHOUSENUM, -PROPERTYADDRESS) %>% 
+  relocate(ADDRESS, .after = PROPERTYOWNER)
+```
+
+Standardize spacing on addresses 
+
+```{r}
+prop$TAXFULLADDRESS1 <- str_squish(prop$TAXFULLADDRESS1)
+prop$CHANGENOTICEADDRESS1 <- str_squish(prop$CHANGENOTICEADDRESS1)
+prop$ADDRESS <- str_squish(prop$ADDRESS)
+```
+
